@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hugging Face Model Search</title>
+    <script>
+        async function searchModel() {
+            const modelName = document.getElementById("model-name").value;
+            const resultDiv = document.getElementById("result");
+            resultDiv.innerHTML = "";
+
+            if (!modelName) {
+                resultDiv.innerHTML = "<p>Please enter a model name.</p>";
+                return;
+            }
+
+            const response = await fetch(`/search?model_name=${encodeURIComponent(modelName)}`);
+            const data = await response.json();
+
+            if (response.ok) {
+                resultDiv.innerHTML = `<p><strong>Model:</strong> ${data.model}</p>
+                                       <p><strong>Description:</strong> ${data.description}</p>`;
+            } else {
+                resultDiv.innerHTML = `<p style="color:red;">${data.error}</p>`;
+            }
+        }
+    </script>
+</head>
+<body>
+    <h1>Hugging Face Model Search</h1>
+    <input type="text" id="model-name" placeholder="Enter model name">
+    <button onclick="searchModel()">Search</button>
+    <div id="result"></div>
+</body>
+</html>
