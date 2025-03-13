@@ -155,16 +155,20 @@ def create_redis_index():
         ], definition=IndexDefinition(prefix=["model:"], index_type=IndexType.HASH))
 
 def store_data_in_redis_faiss(model_id, text):
-    embedding = embedding_model.encode([text], normalize_embeddings=True)[0]  # Ensure consistent normalization
+    embedding = embedding_model.encode([text], normalize_embeddings=True)[0]
     faiss_index.add(np.array([embedding], dtype=np.float32))
     redis_client.set(model_id, json.dumps({"text": text}))
+    # redis_client.hset(f"model:{model_id}", mapping={
+    #     "model_id": model_id, 
+    #     "embedding": embedding.astype(np.float32).tobytes()
+    # })
 
 # Function to fetch and store models
 def fetch_and_store_models():
     print("Fetching models from Hugging Face API...")
     models = list(api.list_models(
             filter="automatic-speech-recognition"
-        )   
+        )
     )
     
     total_models = len(models)
@@ -218,46 +222,99 @@ def search_model():
     if not query:
         return jsonify({"error": "Query is required"}), 400
 
-    # Get minimum similarity threshold (default to 0.0)
-    min_similarity = float(request.args.get('min_similarity', 0.0))
+    print(f"FAISS index size: {faiss_index.ntotal}")
 
-    # Generate query vector with consistent normalization
-    query_vector = embedding_model.encode([query], normalize_embeddings=True)[0]
-    
-    # Search in FAISS index with a larger k to get more candidates
-    k = min(faiss_index.ntotal, 1000)  # Get up to 1000 results or all if less
-    distances, indices = faiss_index.search(query_vector.reshape(1, -1), k=k)
+
+
+    query_vector = embedding_model.encode([query], normalize_embeddings=False)[0]
+    print(f"Query vector shape: {query_vector.shape}, FAISS index shape: {faiss_index.d}")
+
+    distances, indices = faiss_index.search(query_vector.reshape(1, -1), k=10)  # Reshape for batch search
+
+    print(f"Distances: {distances}, Indices: {indices}")
+    # distances, indices = faiss_index.search(np.array([query_vector], dtype=np.float32), k=10)
     
     results = []
-    for idx, distance in zip(indices[0], distances[0]):
+    for idx in indices[0]:
         if idx < 0: continue  # Skip invalid indices
-        
-        # Get model_id using ROWID
-        cursor.execute("SELECT model_id FROM models WHERE ROWID = ?", (int(idx) + 1,))
+        cursor.execute("SELECT model_id FROM models LIMIT 1 OFFSET ?", (int(idx),))
         model_row = cursor.fetchone()
         if model_row:
             model_id = model_row[0]
             metadata = redis_client.get(model_id)
             if metadata:
-                metadata_dict = json.loads(metadata)
-                similarity_score = float(distance)
-                
-                # Only include results above minimum similarity threshold
-                if similarity_score >= min_similarity:
-                    results.append({
-                        "model_id": model_id,
-                        "text": metadata_dict.get("text", ""),
-                        "similarity_score": similarity_score
-                    })
+                results.append({"model_id": model_id, "description": json.loads(metadata)})
 
-    # Sort results by similarity score (higher is better for cosine similarity)
-    results.sort(key=lambda x: x["similarity_score"], reverse=True)
+    print(f"Distances: {distances}, Indices: {indices}")
+    print(f"FAISS index size: {faiss_index.ntotal}")
 
-    return jsonify({
-        "query": query,
-        "total_results": len(results),
-        "results": results
-    })
+    valid_indices = [idx for idx in indices[0] if idx >= 0]  # Remove invalid indices
+    print(f"Valid Indices: {valid_indices}")
+
+    if not valid_indices:
+        print("FAISS returned no valid indices.")
+
+    print(json.dumps(results, indent=4))
+
+
+    return jsonify(results)
+
+    
+    # query_vector = generate_embedding(query)  # Returns a list
+
+
+    # print("Query vector bytes length:", len(query_vector))
+
+    # search_query = Query("*=>[KNN 10 @embedding $vec AS score]").sort_by("score").paging(0, 10).dialect(2)
+    # results = redis_client.ft("model_index").search(search_query, query_params={"vec": query_vector})
+    # print("Raw results:", results)
+
+    # search_query = redis.commands.search.query.Query(f"*=>[KNN {10} @embedding $vec AS score]").sort_by("score").paging(0, 10).dialect(2)
+
+    # results = redis_client.ft("model_index").search(search_query, query_params={"vec": query_vector})
+
+    # # matches = [(doc["word"], float(doc["score"])) for doc in results.docs]
+    # matches = []
+    # for doc in results.docs:
+    #     model_id = doc.id
+    #     score = float(doc.score)
+    #     matches.append((model_id, score))
+    # print(f"Matches: {len(matches)}")
+    # print("Top matches:")
+    # for word, score in matches:
+    #     print(f"{word}: {score}")
+
+    # return [(doc["id"], float(doc["score"])) for doc in results.docs]
+
+
+    # models = []
+    # for doc in results.docs:
+    #     models.append({"model_id": doc["model_id"], "score": float(doc["score"])})
+
+    # models = sorted(models, key=lambda x: x["score"])
+
+    # return jsonify({"query": query, "results": models}) if models else jsonify({"error": "No relevant models found"}), 404
+
+    # return [(doc["word"], float(doc["score"])) for doc in results.docs]
+
+    # try:
+    #     search_result = redis_client.ft("model_index").search(
+    #         search_query, query_params={"query_vector": query_vector}
+    #     )
+
+    #     # Process results
+    #     models = []
+    #     for doc in search_result.docs:
+    #         models.append({"model_id": doc.id, "score": float(doc.score)})
+
+    #     # Sort by similarity (low score = more relevant)
+    #     models = sorted(models, key=lambda x: x["score"])
+
+    #     return jsonify({"query": query, "results": models}) if models else jsonify({"error": "No relevant models found"}), 404
+
+    # except Exception as e:
+    #     print(f"Search error: {e}")
+    #     return jsonify({"error": "Redis search failed"}), 500
 
 def load_from_sqlite_to_redis():
     """

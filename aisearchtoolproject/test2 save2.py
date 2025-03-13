@@ -95,7 +95,6 @@ from huggingface_hub import hf_hub_download
 from flask import Flask, request, jsonify, render_template
 from sentence_transformers import SentenceTransformer
 import sqlite3
-import json
 import pickle
 import faiss
 import numpy as np
@@ -107,7 +106,7 @@ os.chdir("/Users/ronittaleti/AIFindsAi/aisearchtoolproject")
 print("Current working directory:", os.getcwd())
 
 
-conn = sqlite3.connect("ai_tools.db", check_same_thread=False)
+conn = sqlite3.connect("ai_tools.db")
 cursor = conn.cursor()
 # cursor.execute("DROP TABLE IF EXISTS models")
 cursor.execute("""
@@ -121,12 +120,7 @@ conn.commit()
 
 VECTOR_DIMENSION = 384
 
-faiss_index = faiss.IndexFlatIP(VECTOR_DIMENSION)
-
 app = Flask(__name__)
-
-# Load sentence transformer model
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # Initialize Redis client
 redis_client = redis.StrictRedis(host='localhost', port=6379, db=0, decode_responses=False)
@@ -154,17 +148,18 @@ def create_redis_index():
             })
         ], definition=IndexDefinition(prefix=["model:"], index_type=IndexType.HASH))
 
-def store_data_in_redis_faiss(model_id, text):
-    embedding = embedding_model.encode([text], normalize_embeddings=True)[0]  # Ensure consistent normalization
-    faiss_index.add(np.array([embedding], dtype=np.float32))
-    redis_client.set(model_id, json.dumps({"text": text}))
+def store_embedding_in_redis(model_id, embedding):
+    redis_client.hset(f"model:{model_id}", mapping={
+        "model_id": model_id, 
+        "embedding": embedding.astype(np.float32).tobytes()
+    })
 
 # Function to fetch and store models
 def fetch_and_store_models():
     print("Fetching models from Hugging Face API...")
     models = list(api.list_models(
             filter="automatic-speech-recognition"
-        )   
+        )
     )
     
     total_models = len(models)
@@ -186,12 +181,15 @@ def fetch_and_store_models():
                     if readme_text:
                         embedding = generate_embedding(readme_text)
                         store_in_sqlite(model_id, readme_text)
-                        store_data_in_redis_faiss(model_id, readme_text)
+                        store_embedding_in_redis(model_id, embedding)
                 os.remove(readme_path)
             except Exception as e:
                 print(f"Error fetching README for {model_id}: {str(e)}")
     
     print("All models cached successfully.")
+
+# Load sentence transformer model
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 def generate_embedding(text):
     return embedding_model.encode([text], normalize_embeddings=True)[0].astype(np.float32).tobytes()
@@ -218,46 +216,82 @@ def search_model():
     if not query:
         return jsonify({"error": "Query is required"}), 400
 
-    # Get minimum similarity threshold (default to 0.0)
-    min_similarity = float(request.args.get('min_similarity', 0.0))
+    # # Generate embedding for user query
+    # query_embedding = generate_embedding(query)  # Returns a list
 
-    # Generate query vector with consistent normalization
-    query_vector = embedding_model.encode([query], normalize_embeddings=True)[0]
+    # print("Query embedding:", query_embedding)
+
+    # # Convert to Redis-friendly format (FLOAT32)
+    # query_vector = np.array(query_embedding, dtype=np.float32).tobytes()
+    # Generate embedding for user query
     
-    # Search in FAISS index with a larger k to get more candidates
-    k = min(faiss_index.ntotal, 1000)  # Get up to 1000 results or all if less
-    distances, indices = faiss_index.search(query_vector.reshape(1, -1), k=k)
-    
-    results = []
-    for idx, distance in zip(indices[0], distances[0]):
-        if idx < 0: continue  # Skip invalid indices
-        
-        # Get model_id using ROWID
-        cursor.execute("SELECT model_id FROM models WHERE ROWID = ?", (int(idx) + 1,))
-        model_row = cursor.fetchone()
-        if model_row:
-            model_id = model_row[0]
-            metadata = redis_client.get(model_id)
-            if metadata:
-                metadata_dict = json.loads(metadata)
-                similarity_score = float(distance)
-                
-                # Only include results above minimum similarity threshold
-                if similarity_score >= min_similarity:
-                    results.append({
-                        "model_id": model_id,
-                        "text": metadata_dict.get("text", ""),
-                        "similarity_score": similarity_score
-                    })
+    query_vector = generate_embedding(query)  # Returns a list
 
-    # Sort results by similarity score (higher is better for cosine similarity)
-    results.sort(key=lambda x: x["similarity_score"], reverse=True)
 
-    return jsonify({
-        "query": query,
-        "total_results": len(results),
-        "results": results
-    })
+    print("Query vector bytes length:", len(query_vector))
+
+    # search_result = redis_client.execute_command(
+    #     "FT.SEARCH", "model_index",
+    #     "*=>[KNN 5 @embedding $query_vector AS vector_score]",  # Correct KNN syntax
+    #     "SORTBY", "vector_score", "ASC",
+    #     "PARAMS", "2", "query_vector", query_vector,
+    #     "DIALECT", "2"  # Ensure correct RediSearch 2.x dialect
+    # )
+
+    # search_query = Query("*=>[KNN 5 @embedding $vec AS score]") \
+    #     .sort_by("score") \
+    #     .paging(0, 5) \
+    #     .return_fields("score") \
+    #     .dialect(2)
+
+    search_query = Query("*=>[KNN 10 @embedding $vec AS score]").sort_by("score").paging(0, 10).dialect(2)
+    results = redis_client.ft("model_index").search(search_query, query_params={"vec": query_vector})
+    print("Raw results:", results)
+
+    search_query = redis.commands.search.query.Query(f"*=>[KNN {10} @embedding $vec AS score]").sort_by("score").paging(0, 10).dialect(2)
+
+    results = redis_client.ft("model_index").search(search_query, query_params={"vec": query_vector})
+
+    # matches = [(doc["word"], float(doc["score"])) for doc in results.docs]
+    matches = []
+    for doc in results.docs:
+        model_id = doc.id
+        score = float(doc.score)
+        matches.append((model_id, score))
+    print(f"Matches: {len(matches)}")
+    print("Top matches:")
+    for word, score in matches:
+        print(f"{word}: {score}")
+
+    return [(doc["id"], float(doc["score"])) for doc in results.docs]
+    # models = []
+    # for doc in results.docs:
+    #     models.append({"model_id": doc["model_id"], "score": float(doc["score"])})
+
+    # models = sorted(models, key=lambda x: x["score"])
+
+    # return jsonify({"query": query, "results": models}) if models else jsonify({"error": "No relevant models found"}), 404
+
+    # return [(doc["word"], float(doc["score"])) for doc in results.docs]
+
+    # try:
+    #     search_result = redis_client.ft("model_index").search(
+    #         search_query, query_params={"query_vector": query_vector}
+    #     )
+
+    #     # Process results
+    #     models = []
+    #     for doc in search_result.docs:
+    #         models.append({"model_id": doc.id, "score": float(doc.score)})
+
+    #     # Sort by similarity (low score = more relevant)
+    #     models = sorted(models, key=lambda x: x["score"])
+
+    #     return jsonify({"query": query, "results": models}) if models else jsonify({"error": "No relevant models found"}), 404
+
+    # except Exception as e:
+    #     print(f"Search error: {e}")
+    #     return jsonify({"error": "Redis search failed"}), 500
 
 def load_from_sqlite_to_redis():
     """
@@ -271,7 +305,10 @@ def load_from_sqlite_to_redis():
         model_id, readme_text, embedding_blob = row
         key = f"model:{model_id}"
         # Store both readme and embedding in Redis
-        store_data_in_redis_faiss(model_id, readme_text)
+        redis_client.hset(f"model:{model_id}", mapping={
+            "model_id": model_id, 
+            "embedding": generate_embedding(readme_text)
+        })
         count += 1
         print(f"current model #: {count}", end="\r", flush=True)
     print(f"Loaded {count} models from SQLite into Redis.")
@@ -290,12 +327,7 @@ def load_from_sqlite_to_redis():
 if __name__ == '__main__':
     #fetch_and_store_models()
     print(f"Loading models from SQLite into Redis.")
-    # load_from_sqlite_to_redis()
-    # faiss.write_index(faiss_index, "faiss_index.bin")
-    print(f"FAISS index size: {faiss_index.ntotal}")
-    if os.path.exists("faiss_index.bin"):
-        faiss_index = faiss.read_index("faiss_index.bin")
-    print(f"FAISS index size: {faiss_index.ntotal}")    
+    #load_from_sqlite_to_redis()
     create_redis_index()
     # print(list(redis_client.scan_iter("model:*")))
     # sample_key = next(redis_client.scan_iter("model:*"), None)
